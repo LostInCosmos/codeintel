@@ -1,0 +1,6 @@
+# The index itself: regenerable from source, and explicitly not something
+# that should travel anywhere near a deploy — see README.md.
+.data/
+__pycache__/
+*.pyc
+.venv/
