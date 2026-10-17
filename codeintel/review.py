@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import architecture, duplicates, graph
+from .scanner import KNOWN_REPOS, repo_root
 
 SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
 
@@ -40,8 +41,8 @@ SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
 # `ops/` and `scripts/` are additionally documented as standalone, run-by-
 # hand tooling: 04 - Backend/Backend Code Structure.md — "scripts ... run
 # manually, in order"; ops/upload_logs.py is log rotation to R2, invoked by
-# the deploy scripts, not imported.
-ENTRY_POINT_DIRS = {"backend": ("ops", "scripts")}
+# the deploy scripts, not imported. Declared per repo in scanner.KNOWN_REPOS.
+ENTRY_POINT_DIRS = {k.name: k.entry_point_dirs for k in KNOWN_REPOS}
 ENTRY_POINT_NAMES = {"main.py", "main.dart", "main.jsx", "main.tsx"}
 
 _JS_SOURCE_EXT = (".js", ".jsx", ".mjs", ".ts", ".tsx")
@@ -156,9 +157,8 @@ def misplaced_dart_parts(conn: sqlite3.Connection, repo: str) -> list[Finding]:
     """A Dart `part` file stored outside its own library's folder — the
     library is spread across folders on disk, whether or not that also
     happens to form a 2-way package knot (`package_knots` only surfaces a
-    part this way when it does)."""
-    if repo != "mobile":
-        return []
+    part this way when it does). Only the Dart extractor records parts, so
+    any other repo has none and this finds nothing there."""
     level = architecture.DEFAULT_LEVEL.get(repo, 2)
     es = graph.edges(conn, repo, "design", include_tests=False)
     nested = graph.nested_folders({p for pair in es for p in pair})
@@ -174,10 +174,11 @@ def duplicate_pairs(conn: sqlite3.Connection, root: Path, repo: str) -> list[Fin
     """Mergeable pairs only (two files). A group of 3+ is usually a repeated
     shape the documented architecture calls for (every route handler), not
     something to merge — see Phase 3's write-up — so patterns are left out
-    of the reviewer entirely, not merely demoted."""
+    of the reviewer entirely, not merely demoted. So is anything set aside —
+    thin delegates and markup-only components (`duplicates` docstring)."""
     out = []
     for d in duplicates.find(conn, root, include_tests=False):
-        if len(d.members) != 2 or d.members[0].repo != repo:
+        if len(d.members) != 2 or d.members[0].repo != repo or d.set_aside:
             continue
         a, b = d.members
         out.append(Finding(repo, "duplicate", "info", a.path, a.start,
@@ -219,7 +220,7 @@ def mixed_files(conn: sqlite3.Connection, root: Path, repo: str) -> list[Finding
             "ORDER BY start_line", (f["id"],)).fetchall()
         if len(syms) < 4:
             continue   # two groups of 2+ each need at least 4 symbols to begin with
-        path = root / repo / f["path"]
+        path = repo_root(repo, root) / f["path"]
         if not path.exists():
             continue
         text = path.read_text(errors="replace").splitlines()

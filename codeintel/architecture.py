@@ -12,10 +12,12 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from . import graph
+from .scanner import KNOWN_REPOS
 
 # The package granularity that means "a module" in each repo: backend layers
-# (app/services), mobile features (lib/features/capture), admin folders.
-DEFAULT_LEVEL = {"backend": 2, "mobile": 3, "admin_panel": 2}
+# (app/services), mobile features (lib/features/capture), web folders.
+# Declared per repo in scanner.KNOWN_REPOS.
+DEFAULT_LEVEL = {k.name: k.level for k in KNOWN_REPOS}
 
 
 @dataclass

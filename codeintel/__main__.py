@@ -35,13 +35,14 @@ import argparse
 import sys
 
 from . import architecture, duplicates, graph, impact, registry, review, store
-from .scanner import scan
+from .scanner import LABELS, scan
 
 
 def _stats(conn) -> None:
     last = conn.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
     print(f"last scan: {last[0] if last else 'never'}\n")
-    print(f"{'repo':<12} {'lang':<11} {'files':>6} {'tests':>6} {'lines':>8} {'classes':>8} {'funcs':>7} {'errors':>7}")
+    w = max(len(label) for label in ("repo", *LABELS)) + 1
+    print(f"{'repo':<{w}} {'lang':<11} {'files':>6} {'tests':>6} {'lines':>8} {'classes':>8} {'funcs':>7} {'errors':>7}")
     for r in conn.execute("""
         SELECT f.repo, f.language, COUNT(DISTINCT f.id) files, SUM(f.is_test) tests,
                (SELECT SUM(lines) FROM files x WHERE x.repo=f.repo) lines,
@@ -51,7 +52,7 @@ def _stats(conn) -> None:
                  WHERE y.repo=f.repo AND s.kind!='class') funcs,
                SUM(f.parse_error IS NOT NULL) errors
         FROM files f GROUP BY f.repo, f.language ORDER BY f.repo"""):
-        print(f"{r['repo']:<12} {r['language']:<11} {r['files']:>6} {r['tests']:>6} {r['lines']:>8} "
+        print(f"{r['repo']:<{w}} {r['language']:<11} {r['files']:>6} {r['tests']:>6} {r['lines']:>8} "
               f"{r['classes']:>8} {r['funcs']:>7} {r['errors']:>7}")
     own = conn.execute("SELECT COUNT(*) FROM imports WHERE resolved IS NOT NULL").fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0]
@@ -105,7 +106,7 @@ def _file(conn, path: str) -> None:
 # Every report below leads with the answer and keeps the detail behind a
 # flag: easy to read at a glance, nothing hidden that you cannot ask for.
 
-REPOS = ("backend", "mobile", "admin_panel")
+REPOS = LABELS                              # scanner.KNOWN_REPOS, the one list
 SHOW = 12                                   # list length before "--all"
 
 
@@ -251,15 +252,20 @@ def _duplicates(conn, repos: list[str], include_tests: bool, show_all: bool) -> 
 
     for repo in repos:
         mine = [d for d in found if d.members[0].repo == repo]
+        # Thin delegates and markup-only components have no logic of their
+        # own, so a group of them is nothing to merge — counted, listed with --all.
+        aside = [d for d in mine if d.set_aside]
+        mine = [d for d in mine if not d.set_aside]
         # Pairs are concrete and actionable — "these two could be one
         # function". Three or more of the same shape is usually a repeated
-        # IDIOM (every route handler, every migration script) rather than
-        # something to merge, and listing all of its members buries the
-        # pairs under one giant block — so it is summarized, not expanded.
+        # IDIOM (every migration script) rather than something to merge, and
+        # listing all of its members buries the pairs under one giant
+        # block — so it is summarized, not expanded.
         pairs = [d for d in mine if len(d.members) == 2]
         patterns = [d for d in mine if len(d.members) > 2]
         ident = sum(d.identical for d in pairs)
         print(f"{repo}: {len(pairs)} pair(s) ({ident} identical), {len(patterns)} repeated pattern(s) across 3+ places"
+              + (f", {len(aside)} group(s) set aside" if aside else "")
               + ("" if include_tests else "  — test files excluded, --tests to include"))
 
         for d in pairs if show_all else pairs[:SHOW]:
@@ -282,6 +288,15 @@ def _duplicates(conn, repos: list[str], include_tests: bool, show_all: bool) -> 
                     print(f"        … {len(d.members) - len(shown_members)} more (--all)")
                 if d.differences:
                     print(f"        {diff_line(d)}")
+
+        if aside:
+            print("\n  set aside, nothing to merge — thin delegates (one call into already-shared code) and"
+                  " markup only (literal markup, differing only in what it draws)"
+                  + (":" if show_all else "  — --all to list"))
+            for d in aside if show_all else []:
+                print(f"\n    [{'thin delegates' if d.delegates else 'markup only'}] {len(d.members)} places")
+                for m in d.members:
+                    print(f"        {m}")
         print()
 
 

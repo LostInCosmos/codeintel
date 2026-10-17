@@ -50,15 +50,47 @@ def _dart_package(root: Path) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class KnownRepo:
+    """A repo codeintel can index. KNOWN_REPOS is the one place to add another:
+    the CLI's choices, module levels and entry points are all derived from it."""
+    name: str                                # the label every command and report uses
+    folders: tuple[str, ...]                 # checkout folders to look for, in order
+    language: str
+    source_dirs: tuple[str, ...]             # the first must exist for the repo to count as present
+    test_dirs: tuple[str, ...] = ()
+    level: int = 2                           # path depth that names one module (architecture view)
+    entry_point_dirs: tuple[str, ...] = ()   # run by hand, never imported — not orphans
+
+
+# Labels are the names the vault uses; the checkouts were renamed since, so the
+# old folder name is kept as a fallback. Only what is in git is indexed: the
+# backend's `scripts/` is gitignored, so it differs per machine and is not
+# scanned — but it stays an entry point, so a checkout that has it is not
+# told its migrations are orphans.
+KNOWN_REPOS = (
+    KnownRepo("backend", ("bahi_backend", "backend"), "python", ("app", "ops"), ("tests",),
+              entry_point_dirs=("ops", "scripts")),
+    KnownRepo("mobile", ("bahi_app", "mobile"), "dart", ("lib",), ("test",), level=3),
+    KnownRepo("admin_panel", ("admin_panel", "bahi_admin_frontend"), "javascript", ("src",)),
+    KnownRepo("bahi_frontend", ("bahi_frontend", "webapp_frontend"), "javascript", ("src",)),
+)
+LABELS = tuple(k.name for k in KNOWN_REPOS)
+
+
+def repo_root(name: str, root: Path = GSTAPP_ROOT) -> Path:
+    """Directory of the repo labelled `name` (the label is not always the folder name)."""
+    return next((r.root for r in default_repos(root) if r.name == name), root / name)
+
+
 def default_repos(root: Path = GSTAPP_ROOT) -> list[Repo]:
+    """Every known repo checked out under `root`, in KNOWN_REPOS order."""
     repos = []
-    if (root / "backend" / "app").is_dir():
-        repos.append(Repo("backend", root / "backend", "python", ("app", "ops", "scripts"), ("tests",)))
-    if (root / "mobile" / "lib").is_dir():
-        repos.append(Repo("mobile", root / "mobile", "dart", ("lib",), ("test",),
-                          _dart_package(root / "mobile")))
-    if (root / "admin_panel" / "src").is_dir():
-        repos.append(Repo("admin_panel", root / "admin_panel", "javascript", ("src",), ()))
+    for k in KNOWN_REPOS:
+        found = next((root / f for f in k.folders if (root / f / k.source_dirs[0]).is_dir()), None)
+        if found:
+            package = _dart_package(found) if k.language == "dart" else None
+            repos.append(Repo(k.name, found, k.language, k.source_dirs, k.test_dirs, package))
     return repos
 
 
@@ -178,9 +210,19 @@ def _follow_reexports(conn: sqlite3.Connection, repo: str) -> None:
 
 
 def scan(conn: sqlite3.Connection, repos: list[Repo] | None = None, full: bool = False) -> dict:
-    repos = repos if repos is not None else default_repos()
+    everything = repos is None
+    repos = default_repos() if everything else repos
     t0 = time.monotonic()
     stats = {"files": 0, "parsed": 0, "unchanged": 0, "removed": 0, "errors": 0}
+
+    # A full scan of what is configured also drops every repo it did not see —
+    # a label renamed or removed in KNOWN_REPOS, or a checkout that is gone —
+    # rather than leaving its rows in the index for ever. An explicit list
+    # leaves other repos alone.
+    if everything:
+        labels = [r.name for r in repos]
+        cur = conn.execute(f"DELETE FROM files WHERE repo NOT IN ({','.join('?' * len(labels))})", labels)
+        stats["removed"] += cur.rowcount
 
     for repo in repos:
         seen: set[str] = set()

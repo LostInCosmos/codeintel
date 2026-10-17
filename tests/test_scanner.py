@@ -91,6 +91,30 @@ def test_a_deleted_file_is_dropped_and_its_importers_unresolve(conn, py_repo):
     assert after["..core:queue"] == "app/core/__init__.py"
 
 
+def _labels(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT DISTINCT repo FROM files")}
+
+
+def test_scanning_everything_drops_a_repo_no_longer_configured(conn, py_repo, monkeypatch):
+    """DAS-89: renaming a label in KNOWN_REPOS left the old label's rows in
+    the index for ever, reported by `stats` as a fifth repo."""
+    from codeintel import scanner
+
+    scan(conn, [Repo("old_label", py_repo.root, "python", ("app",), ())])
+    monkeypatch.setattr(scanner, "default_repos", lambda: [py_repo])
+    result = scan(conn)
+    assert _labels(conn) == {"backend"}
+    assert result["removed"] > 0
+    assert conn.execute("SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id "
+                        "WHERE f.repo = 'old_label'").fetchone()[0] == 0
+
+
+def test_an_explicit_repo_list_leaves_other_repos_alone(conn, py_repo):
+    scan(conn, [Repo("other", py_repo.root, "python", ("app",), ())])
+    scan(conn, [py_repo])
+    assert _labels(conn) == {"other", "backend"}
+
+
 def test_a_new_file_resolves_its_unchanged_importers(conn, py_repo):
     """Real bug: an import written before its target existed stayed unresolved."""
     write(py_repo.root, "app/workers/later.py", "from app.core.cache import get\n")

@@ -151,7 +151,6 @@ def test_every_pair_within_a_reported_group_independently_holds(conn, tmp_path):
     found = D.find(conn, root.parent, include_tests=False)
 
     import itertools
-    conn2 = conn
     for d in found:
         def toks(m):
             return D.body_tokens((root / m.path).read_text(), m.start, m.end, "python")
@@ -186,3 +185,198 @@ def test_a_chain_with_no_triangle_yields_only_the_real_pairs():
     cliques = D.cliques_from(adj)
     assert {frozenset(c) for c in cliques} == {frozenset({0, 1}), frozenset({1, 2}), frozenset({2, 3})}
     assert all(len(c) == 2 for c in cliques), "no false triangle or larger group"
+
+
+# ---------------------------------------------------- thin delegates
+# DAS-89: the workers' claim_from_db / _run_loop / main were reported as
+# duplicates to merge, though each is one call into code already shared
+# (reconciler.claim_next, loop.run, loop.serve). Same for every API route.
+
+def _lines(src: str) -> set[int]:
+    return D.thin_delegates(textwrap.dedent(src))
+
+
+def test_one_call_with_plain_arguments_is_a_thin_delegate():
+    assert _lines('''
+        def claim(db, worker_id):
+            """Docstrings are not logic."""
+            return reconciler.claim_next(db, SPEC, worker_id)
+
+        async def fetch(x):
+            return await svc.get(x, key=cfg.key, page=None)
+
+        def run(worker_id):
+            loop.run(worker_id, name="extraction", spec=SPEC, poll=settings.poll(), **extra)
+        ''') == {2, 6, 9}
+
+
+def test_any_logic_in_the_body_or_its_arguments_is_not_thin():
+    assert _lines('''
+        def operator(a, b):
+            return f(a + b)
+
+        def two_statements(x):
+            y = x
+            return f(y)
+
+        def comprehension(xs):
+            return f([x for x in xs])
+
+        def subscript(x):
+            return f(x)[0]
+
+        def conditional(x):
+            return f(x) if x else None
+
+        def not_a_call(x):
+            return x
+
+        def docstring_only():
+            """Nothing else."""
+        ''') == set()
+
+
+def test_worker_shaped_delegates_are_set_aside_not_reported(conn, tmp_path):
+    root = tmp_path / "backend"
+    for name in ("extraction", "voice"):
+        write(root, f"app/{name}_worker.py", f'''
+            SPEC = make_spec("{name}")
+
+            def claim_from_db(db, worker_id):
+                """Redis-is-down fallback."""
+                return reconciler.claim_next(db, SPEC, worker_id)
+
+            def _run_loop(worker_id):
+                loop.run(worker_id, name="{name}", spec=SPEC, poll_seconds=settings.{name}_poll)
+            ''')
+    scan(conn, [Repo("backend", root, "python", ("app",), ())])
+    found = D.find(conn, root.parent, include_tests=False)
+    by_name = {d.members[0].qualname: d for d in found}
+    assert {"claim_from_db", "_run_loop"} <= set(by_name)
+    assert by_name["claim_from_db"].delegates and by_name["_run_loop"].delegates
+
+
+def test_route_shaped_delegates_are_set_aside_and_never_a_review_finding(conn, tmp_path):
+    from codeintel import review
+
+    root = tmp_path / "backend"
+    routes = "".join(f'''
+        @router.patch("/{kind}s/{{{kind}_id}}")
+        def update_{kind}(
+            {kind}_id: int,
+            body: dict,
+            db=Depends(get_db),
+        ):
+            return handlers.update_{kind}(db, {kind}_id, body)
+        ''' for kind in ("tenant", "vendor"))
+    write(root, "app/admin.py", routes)
+    scan(conn, [Repo("backend", root, "python", ("app",), ())])
+    found = D.find(conn, root.parent, include_tests=False)
+    assert len(found) == 1 and found[0].delegates
+    assert review.duplicate_pairs(conn, root.parent, "backend") == []
+
+
+def test_a_genuine_duplicate_is_still_reported_beside_delegates(conn, tmp_path):
+    """Setting delegates aside must not hide real repeated logic."""
+    root = tmp_path / "backend"
+    body = "total = 0\nfor x in items:\n    if x.ok:\n        total += x.amount\nreturn total\n"
+    for name in ("a", "b"):
+        write(root, f"app/{name}.py",
+              f"def summed(items):\n{textwrap.indent(body, '    ')}\n"
+              f"def claim(db, w):\n    return reconciler.claim_next(db, SPEC, w)\n")
+    scan(conn, [Repo("backend", root, "python", ("app",), ())])
+    found = {d.members[0].qualname: d for d in D.find(conn, root.parent, include_tests=False)}
+    assert not found["summed"].delegates
+    assert found["claim"].delegates
+
+
+# ---------------------------------------------------- markup-only components
+# DAS-89: the public site's SVG icons were reported as four pairs to merge,
+# though each is literal markup that differs only in what it draws.
+
+def _markup(src: str) -> bool:
+    text = textwrap.dedent(src).strip("\n")
+    return D.markup_only(D.body_tokens(text, 1, len(text.splitlines()), "javascript"))
+
+
+def test_literal_jsx_markup_is_markup_only():
+    assert _markup('''
+        export const ShieldIcon = (p) => (
+          <svg {...common} {...p}>
+            <path d="M12 3l7 3v6Z" />
+            <circle cx="12" cy="13" r="3.5" />
+          </svg>
+        )''')
+    assert _markup('''
+        export function Badge(p) {
+          return (
+            <svg {...p} strokeWidth={2.4}><rect x="1" y={-2} aria-hidden="true" /></svg>
+          );
+        }''')
+
+
+@pytest.mark.parametrize("body", [
+    "<ul>{items.map(x => <li>{x}</li>)}</ul>",            # a call
+    '<button onClick={save}>Save</button>',                # wired to a handler
+    "<div>{open ? <a /> : null}</div>",                    # a condition
+    "<div>{children}</div>",                               # a variable
+    "<div className={`x ${y}`} />",                        # a template literal
+    "<div style={{ color: 'red' }} />",                    # an object
+])
+def test_any_expression_handler_or_variable_is_not_markup_only(body):
+    assert not _markup(f"export const C = (p) => (\n  {body}\n)")
+
+
+def test_a_statement_before_the_markup_is_not_markup_only():
+    assert not _markup('''
+        export function C(p) {
+          const n = p.items.length
+          return <span>{n}</span>
+        }''')
+
+
+def test_icon_components_differing_only_in_drawing_are_set_aside(conn, tmp_path):
+    from codeintel import review
+
+    root = tmp_path / "admin_panel"
+    write(root, "src/icons.jsx", '''
+        const common = { width: 20, height: 20, viewBox: '0 0 24 24' }
+
+        export const AndroidIcon = (p) => (
+          <svg {...common} {...p}>
+            <rect x="6" y="4" width="12" height="16" rx="2.5" />
+            <path d="M9 8h6M12 16v.01" />
+          </svg>
+        )
+
+        export const AppleIcon = (p) => (
+          <svg {...common} {...p}>
+            <rect x="6" y="4" width="12" height="16" rx="2.5" />
+            <path d="M12 16v.01" />
+          </svg>
+        )
+        ''')
+    scan(conn, [Repo("admin_panel", root, "javascript", ("src",), ())])
+    found = D.find(conn, root.parent, include_tests=False)
+    assert len(found) == 1 and found[0].markup and found[0].set_aside
+    assert review.duplicate_pairs(conn, root.parent, "admin_panel") == []
+
+
+def test_a_genuine_js_duplicate_is_still_reported(conn, tmp_path):
+    """Setting markup aside must not hide components that carry logic."""
+    from codeintel import review
+
+    root = tmp_path / "admin_panel"
+    write(root, "src/buttons.jsx", "".join(f'''
+        export function {name}Button({{ onSave }}) {{
+          const [busy, setBusy] = useState(false)
+          if (busy) return null
+          setBusy(true)
+          onSave().finally(() => setBusy(false))
+          return <button disabled={{busy}}>{name}</button>
+        }}
+        ''' for name in ("Save", "Send")))
+    scan(conn, [Repo("admin_panel", root, "javascript", ("src",), ())])
+    found = D.find(conn, root.parent, include_tests=False)
+    assert found and not any(d.set_aside for d in found)
+    assert review.duplicate_pairs(conn, root.parent, "admin_panel")

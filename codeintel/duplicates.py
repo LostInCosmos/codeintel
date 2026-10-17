@@ -36,10 +36,36 @@ Candidates come from three places, all judged by the same two measurements:
 * **same name** in different files — no size floor, since a shared name
   is not a coincidence (two copies of a 4-line `formatTokens`)
 * **similar** — overlapping token sequences, for copies that drifted
+
+"Identical" means identical body tokens: the `def` line, comments and a
+leading docstring are not compared, so two signatures that differ only by a
+trailing comma still read as identical.
+
+**Thin delegates are set aside, not reported as duplicates.** A function
+whose whole body, docstring aside, is one call with only names, literals and
+other such calls as arguments has no logic of its own: two of them "differ
+by two parameters" only because each hands the shared code a different
+spec or setting. The workers' `claim_from_db` / `_run_loop` / `main` call
+`reconciler.claim_next`, `loop.run` and `loop.serve` this way, and every API
+route calls its handler this way (the three-layer rule) — telling anyone to
+merge them sends them to fix what is already shared. A group is set aside
+only when EVERY member is one (`Duplicate.delegates`); Python only, read
+with `ast`, since no Dart or JS pair has this shape today.
+
+**Markup-only components are set aside for the same reason.** A JS
+component whose body is one JSX tree of literal markup — element and
+attribute names, string and number values, `{...spread}` of props, and no
+expression, call, condition or handler — also has no logic of its own. Two
+of them differ only in what they draw: the public site's SVG icons, which
+already share one `common` props object and are kept as separate named
+exports on purpose (DAS-89). A bare `{name}` disqualifies a component, so a
+button wired to a handler is still compared. Again only when EVERY member
+qualifies (`Duplicate.markup`).
 """
 
 from __future__ import annotations
 
+import ast
 import difflib
 import itertools
 import re
@@ -47,6 +73,8 @@ import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .scanner import repo_root
 
 MAX_PARAMS = 3
 # A pair must also share this much of their content, token for token — see
@@ -87,6 +115,12 @@ class Duplicate:
     members: list[Loc]
     differences: list[tuple[str, str]]      # from the most different pair
     found_by: set[str] = field(default_factory=set)
+    delegates: bool = False                 # every member is a thin delegate — nothing to merge
+    markup: bool = False                    # every member is literal markup — nothing to merge
+
+    @property
+    def set_aside(self) -> bool:
+        return self.delegates or self.markup
 
     @property
     def identical(self) -> bool:
@@ -99,6 +133,86 @@ class Duplicate:
     @property
     def in_tests(self) -> bool:
         return all(m.is_test for m in self.members)
+
+
+def _plain(node: ast.expr) -> bool:
+    """A name, a literal, an attribute of one, or a plain call — no operator,
+    subscript, comprehension or lambda, any of which would be logic."""
+    if isinstance(node, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(node, (ast.Attribute, ast.Starred)):
+        return _plain(node.value)
+    return isinstance(node, ast.Call) and _plain_call(node)
+
+
+def _plain_call(call: ast.Call) -> bool:
+    return _plain(call.func) and all(map(_plain, call.args)) and all(_plain(k.value) for k in call.keywords)
+
+
+def _is_delegate(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], (ast.Return, ast.Expr)):
+        return False
+    value = body[0].value
+    if isinstance(value, ast.Await):
+        value = value.value
+    return isinstance(value, ast.Call) and _plain_call(value)
+
+
+def thin_delegates(text: str) -> set[int]:
+    """`def` lines of the functions in this Python source that are thin
+    delegates — see the module docstring. Unparseable source has none."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    return {n.lineno for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_delegate(n)}
+
+
+_IDENT = re.compile(r"[A-Za-z_$][\w$]*$")
+_NUMBER = re.compile(r"\d+(?:\.\d+)?$")
+_MARKUP = {"<", ">", "/", "=", "-", ":", "."}   # tags, attributes, aria-/xlink: names, motion.div
+
+
+def _literal(tok: str) -> bool:
+    """A number, or a quoted string — not a template literal, whose `${}` can hold logic."""
+    return bool(_NUMBER.match(tok)) or (len(tok) >= 2 and tok[0] in "'\"" and tok[-1] == tok[0])
+
+
+def _plain_braces(group: list[str]) -> bool:
+    return (group[:3] == [".", ".", "."] and len(group) == 4 and bool(_IDENT.match(group[3]))
+            or len(group) == 1 and _literal(group[0])
+            or len(group) == 2 and group[0] == "-" and bool(_NUMBER.match(group[1])))
+
+
+def markup_only(toks: list[str]) -> bool:
+    """A JS body that is one JSX tree of literal markup — see the module docstring."""
+    t = toks[1:] if toks[:1] == ["return"] else list(toks)
+    while t and t[0] == "(":
+        t = t[1:]
+    while t and t[-1] in (")", ";", "}"):
+        t = t[:-1]
+    if not t or t[0] != "<" or t[-1] != ">":
+        return False
+    i = 0
+    while i < len(t):
+        if t[i] == "{":
+            try:
+                close = t.index("}", i)
+            except ValueError:
+                return False
+            if not _plain_braces(t[i + 1:close]):
+                return False
+            i = close + 1
+            continue
+        if not (t[i] in _MARKUP or _IDENT.match(t[i]) or _literal(t[i])):
+            return False
+        i += 1
+    return True
 
 
 def body_tokens(text: str, start: int, end: int, language: str) -> list[str]:
@@ -180,16 +294,19 @@ def find(conn: sqlite3.Connection, root: Path, include_tests: bool = True,
         FROM symbols s JOIN files f ON f.id = s.file_id
         WHERE s.kind != 'class' AND s.end_line > s.start_line""").fetchall()
     texts: dict[tuple[str, str], str] = {}
+    thin: dict[tuple[str, str], set[int]] = {}
     syms = []
     for r in rows:
         if r["is_test"] and not include_tests:
             continue
         key = (r["repo"], r["path"])
         if key not in texts:
-            texts[key] = (root / r["repo"] / r["path"]).read_text()
+            texts[key] = (repo_root(r["repo"], root) / r["path"]).read_text()
+            thin[key] = thin_delegates(texts[key]) if r["language"] == "python" else set()
         toks = body_tokens(texts[key], r["start_line"], r["end_line"], r["language"])
         loc = Loc(r["repo"], r["path"], r["qualname"], r["start_line"], r["end_line"], bool(r["is_test"]))
-        syms.append((loc, r["name"], r["body_hash"], toks))
+        markup = r["language"] == "javascript" and markup_only(toks)
+        syms.append((loc, r["name"], r["body_hash"], toks, r["start_line"] in thin[key], markup))
 
     candidates: dict[tuple[int, int], set[str]] = defaultdict(set)
     big = [i for i, s in enumerate(syms) if s[0].end - s[0].start + 1 >= MIN_LINES]
@@ -251,7 +368,8 @@ def find(conn: sqlite3.Connection, root: Path, include_tests: bool = True,
         found_by: set[str] = set()
         for a, b in itertools.combinations(members, 2):
             found_by |= candidates.get((a, b), candidates.get((b, a), set()))
-        c = Duplicate([syms[k][0] for k in members], worst, found_by)
+        c = Duplicate([syms[k][0] for k in members], worst, found_by,
+                      all(syms[k][4] for k in members), all(syms[k][5] for k in members))
         c.members.sort(key=lambda m: (m.path, m.start))
         out.append(c)
     return sorted(out, key=lambda c: (c.in_tests, len(c.differences), -c.lines * len(c.members)))
